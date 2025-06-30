@@ -25,7 +25,7 @@ LLM_v1 is a research-focused, GPT-style large language model designed for effici
   - Gradient Checkpointing: Supported
 
 - **Performance**
-  - Achieves ~13,000 tokens/sec on RTX 5090 with 2048 context length and FlashAttention
+  - Achieves ~12,000 tokens/sec on RTX 5090 with 2048 context length and FlashAttention
   - Memory-efficient training via bitsandbytes + streaming
 
 ## 🛠 Installation
