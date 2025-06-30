@@ -39,14 +39,13 @@ pip install -r requirements.txt
 ## 🧪 Training
 
 ```bash
-python train.py \
-    --model_config configs/llm_v1.json \
-    --tokenizer your_tokenizer_path_or_type \
-    --dataset fineweb-edu \
-    --use_flash_attention \
-    --mixed_precision bf16 \
-    --optimizer galore_adamw_8bit \
-    --streaming True
+python ./training/training.py \
+      --config-json=./training/sample.json \
+      --attention-type=gpa \
+      --tokenizer-type=cl100k_base \
+      --optimizer-type=AdamW8bit_opt \
+      --learning-rate=1e-4 \
+      --epochs=3
 ```
 
 Training is streamed in batches — no full dataset download required.
@@ -55,16 +54,15 @@ Training is streamed in batches — no full dataset download required.
 
 ```json
 {
-  "vocab_size": 100277,
-  "context_length": 2048,
-  "emb_dim": 2048,
-  "n_heads": 16,
-  "n_layers": 16,
-  "drop_rate": 0.0,
-  "qkv_bias": false,
-  "norm_type": "rmsnorm",
-  "ff_type": "swiglu",
-  "tie_embeddings": true
+    "vocab_size": 100277,
+    "context_length": 2048,
+    "emb_dim": 2048,
+    "n_heads": 32,
+    "n_layers": 16,
+    "drop_rate": 0.0,
+    "qkv_bias": false,
+    "n_groups": 8,
+    "use_flash_attention": true
 }
 ```
 
