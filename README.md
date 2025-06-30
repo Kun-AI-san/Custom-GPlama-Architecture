@@ -5,7 +5,7 @@ LLM_v1 is a research-focused, GPT-style large language model designed for effici
 ## 🚀 Features
 
 - **Architecture**
-  - 16 transformer layers, 16 heads
+  - 32 transformer layers, 16 heads
   - Embedding dim: 2048, Context length: 2048
   - Grouped Query Attention (GQA)
   - SwiGLU Feedforward with RMSNorm
