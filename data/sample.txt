@@ -1,0 +1,1 @@
+Natural Language Processing (NLP) is a subfield of artificial intelligence that focuses on the interaction between computers and human language. Tokenization is the process of breaking down text into smaller units such as words or subwords. This allows machines to better understand and process human language for tasks like sentiment analysis, translation, and question answering.
