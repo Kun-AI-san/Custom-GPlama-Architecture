@@ -66,17 +66,13 @@ Training is streamed in batches — no full dataset download required.
 }
 ```
 
-## 🧠 Architecture Diagram
-
-(Add a figure here using Mermaid or a hand-drawn attention block diagram.)
-
 ## 📈 Benchmarking
 
 | Feature              | Value                |
 |----------------------|----------------------|
 | Context Length       | 2048 tokens          |
 | Tokens/sec (RTX 5090)| ~12,000              |
-| Precision            | bf16 (AMP)           |
+| Precision            | f16          |
 | Optimizer            | AdamW8bit (bitsandbytes/GaLore) |
 | Dataset              | fineweb-edu (streaming) |
 
