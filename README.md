@@ -5,8 +5,8 @@ LLM_v1 is a research-focused, GPT-style large language model designed for effici
 ## 🚀 Features
 
 - **Architecture**
-  - 32 transformer layers, 16 heads
-  - Embedding dim: 2048, Context length: 2048
+  - 24 transformer layers, 14 heads
+  - Embedding dim: 896, Context length: 2048
   - Grouped Query Attention (GQA)
   - SwiGLU Feedforward with RMSNorm
   - Tied output projection head
@@ -56,12 +56,12 @@ Training is streamed in batches — no full dataset download required.
 {
     "vocab_size": 100277,
     "context_length": 2048,
-    "emb_dim": 2048,
-    "n_heads": 32,
-    "n_layers": 16,
+    "emb_dim": 896,
+    "n_heads": 24,
+    "n_layers": 14,
     "drop_rate": 0.0,
     "qkv_bias": false,
-    "n_groups": 8,
+    "n_groups": 7,
     "use_flash_attention": true
 }
 ```
@@ -72,9 +72,9 @@ Training is streamed in batches — no full dataset download required.
 |----------------------|----------------------|
 | Context Length       | 2048 tokens          |
 | Tokens/sec (RTX 5090)| ~12,000              |
-| Precision            | f16          |
-| Optimizer            | AdamW8bit (bitsandbytes/GaLore) |
-| Dataset              | fineweb-edu (streaming) |
+| Precision            | bf16          |
+| Optimizer            | AdamW (pytorch) |
+| Dataset(s)              | fineweb-edu,stackv2 (python), openmath (streaming) |
 
 ## 📚 Acknowledgements
 
@@ -88,6 +88,6 @@ This model was inspired by architectural components from:
 ## 🧩 Next Steps
 
 - [ ] Add weight initialization from pretraining checkpoints
-- [ ] Integrate LoRA adapters
-- [ ] Add support for rotary embeddings
-- [ ] Inference & evaluation scripts
+- [x] Integrate LoRA adapters
+- [x] Add support for rotary embeddings
+- [x] Inference & evaluation scripts
