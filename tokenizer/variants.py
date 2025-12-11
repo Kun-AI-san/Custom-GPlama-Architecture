@@ -55,10 +55,17 @@ class SimpleTokenizer:
 
 class BPE_tokenizer:
     def __init__(self, bpe_type = 'cl100k_base'):
-        self.tokenizer = tiktoken.get_encoding(bpe_type)
+        self.enc = tiktoken.get_encoding(bpe_type)
+        self.new_tokens = ['<|prompt|>', '<|response|>']
+        self.tokenizer = tiktoken.Encoding(
+            name='cl100k_base_extended',
+            pat_str=self.enc._pat_str,
+            mergeable_ranks=self.enc._mergeable_ranks,
+            special_tokens={**self.enc._special_tokens, **{tok:self.enc.n_vocab + i for i, tok in enumerate(self.new_tokens)}}
+        )
 
     def encode(self, text: str):
-        return self.tokenizer.encode(text, allowed_special={"<|endoftext|>"})
+        return self.tokenizer.encode(text, allowed_special={"<|endoftext|>", "<|prompt|>", "<|response|>"})
 
     def decode(self, token_ids: list):
         return self.tokenizer.decode(token_ids)

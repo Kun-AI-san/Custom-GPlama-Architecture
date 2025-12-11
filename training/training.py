@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torchdata.stateful_dataloader import StatefulDataLoader
 from torch.utils.data import DataLoader
-from datasets import load_dataset
+from datasets import load_dataset, interleave_datasets, IterableDataset, Features, Value, load_from_disk
 import sys
 import os
 sys.path.insert(1, os.getcwd())
@@ -13,49 +13,23 @@ import bitsandbytes as bnb
 import argparse
 import json
 import time
-import tqdm
+import mlflow
+from mlflow.models import infer_signature
+from models.schedulers import get_trap_scheduler
+import boto3
+from botocore import UNSIGNED
+from botocore.client import Config
+from smart_open import open
+import matplotlib.pyplot as plt
+import gc
+import numpy as np
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
-def generate_text_simple(model, idx, max_new_tokens, context_size, temperature_scale=0.0, top_k=None, eos_id=None):
-    # idx is (batch, n_tokens) array of indices in the current context
-    for _ in range(max_new_tokens):
-        
-        # Crop current context if it exceeds the supported context size
-        # E.g., if LLM supports only 5 tokens, and the context size is 10
-        # then only the last 5 tokens are used as context
-        idx_cond = idx[:, -context_size:]
-        
-        # Get the predictions
-        with torch.no_grad():
-            logits = model(idx_cond) ### batch, n_tokens, vocab_size
-        
-        # Focus only on the last time step
-        # (batch, n_tokens, vocab_size) becomes (batch, vocab_size)
-        logits = logits[:, -1, :]  
-        if temperature_scale>0.0:
-        # Apply softmax to get probabilities
-            logits = logits//temperature_scale
-            probas = torch.softmax(logits, dim=-1)  # (batch, vocab_size)
-            idx_next = torch.multinomial(probas, num_samples=1)
-        else:
-            # Get the idx of the vocab entry with the highest probability value
-            idx_next = torch.argmax(probas, dim=-1, keepdim=True)  # (batch, 1)
-        if idx_next == eos_id:
-            break
-        # Append sampled index to the running sequence
-        idx = torch.cat((idx, idx_next), dim=1)  # (batch, n_tokens+1)
+s3 = boto3.client('s3', region_name='us-east-1', config=Config(signature_version=UNSIGNED))
 
-    return idx
-
-def text_to_token_ids(text, tokenizer):
-    encoded = tokenizer.encode(text)
-    encoded_tensor = torch.tensor(encoded).unsqueeze(0) # add batch dimension
-    return encoded_tensor
-
-def token_ids_to_text(token_ids, tokenizer):
-    flat = token_ids.squeeze(0) # remove batch dimension
-    return tokenizer.decode(flat.tolist())
-
-def calculate_batch_loss(batch_input, batch_target, model, device) -> nn.functional.cross_entropy:
+def calculate_batch_loss(batch_input, batch_target, model, device):
     batch_input, batch_target = batch_input.to(device), batch_target.to(device)
 
     logits = model(batch_input)
@@ -64,70 +38,351 @@ def calculate_batch_loss(batch_input, batch_target, model, device) -> nn.functio
 
     return loss
 
-def create_chunk_dataloader(token_ids, batch_size=3, max_length=2048, stride=2048, num_workers=0) -> DataLoader:
+def create_chunk_dataloader(token_ids, batch_size=4, max_length=2048, stride=2048, num_workers=0) -> DataLoader:
     dataset = ChunkLoader(token_ids, max_length, stride)
 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, drop_last=True, num_workers=num_workers)
 
     return dataloader
 
+def extract_text(example):
+    if 'blob_id' in example:
+        if example['blob_id'] is not None:
+            s3_url = f"s3://softwareheritage/content/{example['blob_id']}"
+            try:
+                with open(s3_url, 'rb', compression='.gz', transport_params={'client': s3}) as s3bucket:
+                    content = s3bucket.read()
+                    content = content.decode(example['src_encoding'])
+                    example['text'] = content
+            except Exception as e:
+                print(f'Failed to process {s3_url}: {e}')
+                example['text'] = ''
+    return example
+    
+def extract_instruction(example):
+    prompt = example['prompt']
+    response = example['text']
+    example['text'] = "<|prompt|>"+prompt+"<|response|>"+response
+    return example
 
-def train(model, device, optimizer, tokenizer, mem_optimized_training, args) -> None:
+def setup_distributed(rank, world_size):
+    os.environ['MASTER_ADDR'] = '127.0.0.1'
+    os.environ['MASTER_PORT'] = '12355'
+
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.barrier()
+    torch.cuda.set_device(rank)
+
+def clean_distributed():
+    dist.destroy_process_group()
+
+def train_multi_gpu(rank, world_size, model, optimizer, scheduler, tokenizer, mem_optimized_training, args) -> None:
+
+    torch.manual_seed(1234)
+    setup_distributed(rank, world_size)
+    
+    device = torch.device(f'cuda:{rank}')
+    model = model.to(device)
+    model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+
     def tokenize_and_combine(batch):
         enc_text_total = []
         for sample in batch:
-            enc_text = tokenizer.encode(sample['text'])
+            # print(sample)
+            enc_text = tokenizer.encode(sample['text']+'<|endoftext|>')
             enc_text_total = enc_text_total + enc_text
         return enc_text_total
-    
-    dataset = load_dataset("HuggingFaceFW/fineweb-edu", name='sample-10BT', split='train', streaming=True)
-    main_dataloader = StatefulDataLoader(dataset, batch_size=1024, collate_fn=tokenize_and_combine, num_workers=8)
-    
-    if os.path.exists('./data/checkpoints'):
-        main_dataloader.load_state_dict(torch.load('./data/checkpoints'))
-    
-    scaler = torch.amp.GradScaler(device=device.type)
+
     loss_list = []
     for epoch in range(args.epochs):
-        model.train()
-        i = 0
-        for batch in tqdm.tqdm(main_dataloader):
+        ds_fw = load_dataset("HuggingFaceTB/smollm-corpus", name='fineweb-edu-dedup', split='train', streaming=True)
+        ds_cos = load_dataset("HuggingFaceTB/smollm-corpus", name='cosmopedia-v2', split='train', streaming=True)
+        ds_fw = ds_fw.map(extract_text, remove_columns=['id', 'metadata'])
+        ds_cos = ds_cos.map(extract_instruction, remove_columns=['prompt', 'token_length', 'audience', 'format', 'seed_data'])
+        ds_python = load_dataset("Kun-AI-san/stack_v2_cpjp", name='python_dataset', split='train', streaming=True)
+        ds_python = ds_python.remove_columns(['detected_liceses'])
+        ds_cpp = load_dataset("Kun-AI-san/stack_v2_cpjp", name='cpp_dataset', split='train', streaming=True)
+        ds_cpp = ds_cpp.remove_columns(['detected_liceses'])
+        ds_java = load_dataset("Kun-AI-san/stack_v2_cpjp", name='java_dataset', split='train', streaming=True)
+        ds_java = ds_java.remove_columns(['detected_liceses'])
+        ds_math = load_dataset("open-web-math/open-web-math", split="train", streaming=True)
+        ds_math = ds_math.map(extract_text, remove_columns=['url', 'date', 'metadata'])
+
+        dataset = interleave_datasets([ds_python, ds_fw, ds_cpp, ds_java, ds_math, ds_cos], probabilities=[0.075, 0.5, 0.075, 0.075, 0.075, 0.2], stopping_strategy='all_exhausted')
+
+        dataset = dataset.skip(rank*9e6)
+
+        main_dataloader = StatefulDataLoader(dataset, batch_size=9000, collate_fn=tokenize_and_combine) # type: ignore
+        if os.path.exists('./data/checkpoints'):
+            main_dataloader.load_state_dict(torch.load('./data/checkpoints'))
+        val_dataset = list(load_dataset("HuggingFaceFW/fineweb-edu", name='sample-100BT', split='train', streaming=True).take(4096))
+        val_daloader = StatefulDataLoader(val_dataset, batch_size=4096, collate_fn=tokenize_and_combine)
+
+        if rank == 0:
+            i = 0
+            total_loss = 0.0
+            total_acc_steps = 0
+            accumulation_factor = 32
+            all_tokens = 0
+            train_loss_list = []
+            val_loss_list = []
+            tokens_seen_list = []
+    
+        if rank == 0 and os.path.exists('./training/val_loss_list.npy'):
+            tokens_seen_list = np.load('tokens_seen_list.npy').tolist()
+            train_loss_list = np.load('train_loss_list.npy').tolist()
+            val_loss_list = np.load('val_loss_list.npy').tolist()
+            all_tokens = tokens_seen_list[-1]
+        
+        for ind, batch in enumerate(main_dataloader):
+            model.train()
             start_time = time.time()
             dataloader = create_chunk_dataloader(token_ids=batch)
             true_batch_loss = 0.0
             total_tokens = 0
             for batch_input, batch_target in dataloader:
-                if not mem_optimized_training:
-                    with torch.autocast(device_type=device.type, dtype=torch.float16):
+                total_acc_steps+=1
+                if mem_optimized_training:
+                    # print("mem_opt_training")
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                         loss = calculate_batch_loss(batch_input, batch_target, model, device)
-                        scaler.scale(loss).backward()
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
+                        loss = loss / accumulation_factor
+                    loss.backward()
                 else:
                     loss = calculate_batch_loss(batch_input, batch_target, model, device)
+                    loss = loss / accumulation_factor
                     loss.backward()
-                    nn.utils.clip_grad_norm_([p for p in model.parameters()], 1.0)
+                if total_acc_steps % accumulation_factor == 0:
+                    for name, param in model.named_parameters():
+                        if torch.isnan(param).any():
+                            print(f'NaNs in parameter {name}')
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            print(f'NaNs in the gradient of {name}')
+                    if torch.isnan(loss):
+                        print('NaNs in loss')
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
                 true_batch_loss += loss.item()
                 total_tokens += batch_input.numel()
+                all_tokens += batch_input.numel()
+            true_batch_loss/=(len(dataloader)+1e-6)
+            if rank == 0:
+                torch.save(main_dataloader.state_dict(), './data/checkpoints')
+                torch.save(model.state_dict(), './models/main_model_v1')
+                torch.save(optimizer.state_dict(), './models/optimizer_step')
+                torch.save(scheduler.state_dict(), './models/scheduler_step')
+            total_time = time.time() - start_time
+            if rank == 0:
+                print(
+                    'tokens_per_sec:', (total_tokens/total_time),
+                    'batch_tokens:', total_tokens,
+                    'total_time:', total_time,
+                    'Batch_loss:', (true_batch_loss * accumulation_factor),
+                    'learning_rate:', scheduler.get_lr(),
+                    'total_tokens_seen:', all_tokens,
+                    'step:', ind + 1
+                )
+            if ind%50 == 0:
+                model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for batch in val_daloader:
+                        dataloader = create_chunk_dataloader(batch)
+                        for batch_input, batch_target in dataloader:
+                            if mem_optimized_training:
+                            # print("mem_opt_training")
+                                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                    loss = calculate_batch_loss(batch_input, batch_target, model, device)
+                            else:
+                                loss = calculate_batch_loss(batch_input, batch_target, model, device)
+                            val_loss+=loss.item()
+                    val_loss_tensor = torch.tensor(val_loss, device=device)
+                    dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.SUM)
+                    val_loss = val_loss_tensor.item()/world_size
+
+                    if rank==0:
+                        print('Validation loss: ', val_loss/len(dataloader))
+                        train_loss_list.append(true_batch_loss * accumulation_factor)
+                        val_loss_list.append(val_loss/len(dataloader))
+                        tokens_seen_list.append(all_tokens)
+                        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+                        # Plot training and validation loss against epochs
+                        ax1.plot(tokens_seen_list, train_loss_list, label="Training loss")
+                        ax1.plot(tokens_seen_list, val_loss_list, linestyle="-.", label="Validation loss")
+                        ax1.set_xlabel("Tokens seen")
+                        ax1.set_ylabel("Loss")
+                        ax1.legend(loc="upper right")
+                        fig.tight_layout()
+                        fig.savefig('progress.png')
+                        plt.close('all')
+                        gc.collect()
+                        np.save('tokens_seen_list', tokens_seen_list)
+                        np.save('train_loss_list', train_loss_list)
+                        np.save('val_loss_list', val_loss_list)
+
+            i+=1
+            total_loss+=(true_batch_loss*accumulation_factor)
+        if rank == 0 and os.path.exists('./data/checkpoints'):
+            os.remove('./data/checkpoints')
+        total_loss/=(i+1e-6)
+        # mlflow.log_metric("Epoch Loss", total_loss)
+        loss_list.append(total_loss)
+    if rank==0:
+        print('epoch loss:', loss_list)
+    clean_distributed()
+
+
+def train(model, device, optimizer, scheduler, tokenizer, mem_optimized_training, args) -> None:
+
+    print("Single GPU mode")
+
+    torch.manual_seed(1234)
+
+    model = model.to(device=device)
+
+    def tokenize_and_combine(batch):
+        enc_text_total = []
+        for sample in batch:
+            # print(sample)
+            enc_text = tokenizer.encode(sample['text']+'<|endoftext|>')
+            enc_text_total = enc_text_total + enc_text
+        return enc_text_total
+
+    loss_list = []
+    for epoch in range(args.epochs):
+        ds_fw = load_dataset("HuggingFaceTB/smollm-corpus", name='fineweb-edu-dedup', split='train', streaming=True)
+        ds_cos = load_dataset("HuggingFaceTB/smollm-corpus", name='cosmopedia-v2', split='train', streaming=True)
+        ds_fw = ds_fw.map(extract_text, remove_columns=['id', 'metadata'])
+        ds_cos = ds_cos.map(extract_instruction, remove_columns=['prompt', 'token_length', 'audience', 'format', 'seed_data'])
+        ds_python = load_dataset("Kun-AI-san/stack_v2_cpjp", name='python_dataset', split='train', streaming=True)
+        ds_python = ds_python.remove_columns(['detected_liceses'])
+        ds_cpp = load_dataset("Kun-AI-san/stack_v2_cpjp", name='cpp_dataset', split='train', streaming=True)
+        ds_cpp = ds_cpp.remove_columns(['detected_liceses'])
+        ds_java = load_dataset("Kun-AI-san/stack_v2_cpjp", name='java_dataset', split='train', streaming=True)
+        ds_java = ds_java.remove_columns(['detected_liceses'])
+        
+        ds_math = load_dataset("open-web-math/open-web-math", split="train", streaming=True)
+        ds_math = ds_math.map(extract_text, remove_columns=['url', 'date', 'metadata'])
+
+        dataset = interleave_datasets([ds_python, ds_fw, ds_cpp, ds_java, ds_math, ds_cos], probabilities=[0.075, 0.5, 0.075, 0.075, 0.075, 0.2], stopping_strategy='all_exhausted')
+        main_dataloader = StatefulDataLoader(dataset, batch_size=43000, collate_fn=tokenize_and_combine) # type: ignore
+        if os.path.exists('./data/checkpoints'):
+            main_dataloader.load_state_dict(torch.load('./data/checkpoints'))
+        val_dataset = list(load_dataset("HuggingFaceFW/fineweb-edu", name='sample-100BT', split='train', streaming=True).take(4096))
+        val_daloader = StatefulDataLoader(val_dataset, batch_size=4096, collate_fn=tokenize_and_combine)
+
+        i = 0
+        total_loss = 0.0
+        total_acc_steps = 0
+        accumulation_factor = 32
+        all_tokens = 0
+        train_loss_list = []
+        val_loss_list = []
+        tokens_seen_list = []
+
+        if os.path.exists('./training/val_loss_list.npy'):
+            tokens_seen_list = np.load('tokens_seen_list.npy').tolist()
+            train_loss_list = np.load('train_loss_list.npy').tolist()
+            val_loss_list = np.load('val_loss_list.npy').tolist()
+            all_tokens = tokens_seen_list[-1]
+
+        for ind, batch in enumerate(main_dataloader):
+            model.train()
+            start_time = time.time()
+            dataloader = create_chunk_dataloader(token_ids=batch)
+            true_batch_loss = 0.0
+            total_tokens = 0
+            for batch_input, batch_target in dataloader:
+                total_acc_steps+=1
+                if mem_optimized_training:
+                    # print("mem_opt_training")
+                    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                        loss = calculate_batch_loss(batch_input, batch_target, model, device)
+                        loss = loss / accumulation_factor
+                    loss.backward()
+                else:
+                    loss = calculate_batch_loss(batch_input, batch_target, model, device)
+                    loss = loss / accumulation_factor
+                    loss.backward()
+                if total_acc_steps % accumulation_factor == 0:
+                    for name, param in model.named_parameters():
+                        if torch.isnan(param).any():
+                            print(f'NaNs in parameter {name}')
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            print(f'NaNs in the gradient of {name}')
+                    if torch.isnan(loss):
+                        print('NaNs in loss')
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                true_batch_loss += loss.item()
+                total_tokens += batch_input.numel()
+                all_tokens += batch_input.numel()
             true_batch_loss/=(len(dataloader)+1e-6)
             torch.save(main_dataloader.state_dict(), './data/checkpoints')
             torch.save(model.state_dict(), './models/main_model_v1')
+            torch.save(optimizer.state_dict(), './models/optimizer_step')
+            torch.save(scheduler.state_dict(), './models/scheduler_step')
             total_time = time.time() - start_time
-            print('tokens per sec:', (total_tokens/total_time), 'total tokens:', total_tokens, 'total time:', total_time)
-        loss_list.append(true_batch_loss)
+            print(
+                'tokens_per_sec:', (total_tokens/total_time),
+                'batch_tokens:', total_tokens,
+                'total_time:', total_time,
+                'Batch_loss:', (true_batch_loss * accumulation_factor),
+                'learning_rate:', scheduler.get_lr(),
+                'total_tokens_seen:', all_tokens,
+                'step:', ind + 1
+            )
+            if ind%50 == 0:
+                model.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for batch in val_daloader:
+                        dataloader = create_chunk_dataloader(batch)
+                        for batch_input, batch_target in dataloader:
+                            if mem_optimized_training:
+                            # print("mem_opt_training")
+                                with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                                    loss = calculate_batch_loss(batch_input, batch_target, model, device)
+                            else:
+                                loss = calculate_batch_loss(batch_input, batch_target, model, device)
+                            val_loss+=loss.item()
+                        print('Validation loss: ', val_loss/len(dataloader))
+                    train_loss_list.append(true_batch_loss * accumulation_factor)
+                    val_loss_list.append(val_loss/len(dataloader))
+                    tokens_seen_list.append(all_tokens)
+                    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+                    # Plot training and validation loss against epochs
+                    ax1.plot(tokens_seen_list, train_loss_list, label="Training loss")
+                    ax1.plot(tokens_seen_list, val_loss_list, linestyle="-.", label="Validation loss")
+                    ax1.set_xlabel("Tokens seen")
+                    ax1.set_ylabel("Loss")
+                    ax1.legend(loc="upper right")
+                    fig.tight_layout()
+                    fig.savefig('progress.png')
+                    plt.close('all')
+                    gc.collect()
+                    np.save('tokens_seen_list', tokens_seen_list)
+                    np.save('train_loss_list', train_loss_list)
+                    np.save('val_loss_list', val_loss_list)
+
+            i+=1
+            total_loss+=(true_batch_loss*accumulation_factor)
+        os.remove('./data/checkpoints')
+        total_loss/=(i+1e-6)
+        # mlflow.log_metric("Epoch Loss", total_loss)
+        loss_list.append(total_loss)
     print('epoch loss:', loss_list)
 
 def main(parser:argparse.ArgumentParser) -> None:
     parser.add_argument(
         '--config-json',
         type = str,
-        required=True
-    )
-    parser.add_argument(
-        '--attention-type',
-        type = str,
-        choices= ['mha', 'gpa', 'mla'],
         required=True
     )
     parser.add_argument(
@@ -140,6 +395,11 @@ def main(parser:argparse.ArgumentParser) -> None:
         '--optimizer-type',
         type = str,
         choices= ['Adam', 'AdamW', 'AdamW8bit_opt'],
+        required=True
+    )
+    parser.add_argument(
+        '--mem-opt',
+        type = bool,
         required=True
     )
     parser.add_argument(
@@ -162,7 +422,10 @@ def main(parser:argparse.ArgumentParser) -> None:
         type = int,
         required=False
     )
-    
+
+    # mlflow.set_tracking_uri(uri="http://127.0.0.1:8080")
+    # mlflow.set_experiment('MLflow_quickstart')
+
     args = parser.parse_args()
     config = None
     assert os.path.exists(args.config_json), \
@@ -172,91 +435,73 @@ def main(parser:argparse.ArgumentParser) -> None:
     
     device = torch.device(
         "cuda:0" if torch.cuda.is_available()
-        else "rocm:0" if torch.rocm.is_available()
         else "cpu"
         )
+    world_size = 1
+    if torch.cuda.is_available():
+        world_size = torch.cuda.device_count()
     
     tokenizer = None
     if args.tokenizer_type == 'gpt2' or args.tokenizer_type == 'cl100k_base':
         tokenizer = BPE_tokenizer(args.tokenizer_type)
     elif args.tokenizer_type == 'sentencepiece':
-        TODO
+        TODO # type: ignore
     else:
         tokenizer = SpacyTokenizer()
     
-    mem_optimized_training = (args.optimizer_type=='AdamW8bit_opt')
-    
-    if mem_optimized_training:
-        model = LLM_v1(config).half()
-    else:
-        model = LLM_v1(config)
-    
-    model.to(device=device)
-    model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+    model = LLM_v1(config)
+    model = torch.compile(model, mode="default")
+
+    mem_optimized_training = args.mem_opt
 
     if os.path.exists('./models/main_model_v1'):
         state_dict = torch.load('./models/main_model_v1')
         model.load_state_dict(state_dict)
-    
+
+    # with mlflow.start_run():
+        # mlflow.log_params(config)
     optimizer = None
-    
-    if mem_optimized_training:
-        target_modules = ['attention', 'mlp']
-        galore_params = []
+    scheduler = None
 
-        for module_name, module in model.named_modules():
-            if not isinstance(module, nn.Linear):
-                continue
-            if not any(
-                        target_key in module_name
-                        for target_key in target_modules
-                    ):
-                continue
-            galore_params.append(module.weight)
-        
-        id_galore_params = [id(param) for param in galore_params]
-
-        non_galore_params = [
-            param for param in model.parameters()
-            if id(param) not in id_galore_params
-        ]
-
-        optimizer_dict = {}
-
-        for p in model.parameters():
-            if p.requires_grad:
-                if id(p) in id_galore_params:
-                    optimizer_dict[p] = bnb.optim.AdamW8bit(
-                        [p], lr=args.learning_rate, weight_decay=0.1
-                    )
-                else:
-                    optimizer_dict[p] = bnb.optim.Adam8bit(
-                        [p], lr=args.learning_rate, weight_decay=0.1
-                    )
-        
-        def optimizer_hook(p):
-            if p.grad is None: 
-                return
-            optimizer_dict[p].step()
-            optimizer_dict[p].zero_grad()
-
-        # Register the hook onto every parameter
-        for p in model.parameters():
-            if p.requires_grad:
-                p.register_post_accumulate_grad_hook(optimizer_hook)
-    
+    if args.optimizer_type == 'AdamW':
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.learning_rate
+        )
+    elif args.optimizer_type == 'AdamW8bit_opt':
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=args.learning_rate)
     else:
-        if args.optimizer_type == 'AdamW':
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=args.learning_rate
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=args.learning_rate
+        )
+    scheduler = get_trap_scheduler(
+        optimizer=optimizer, total_steps=43000, num_warmup_steps=2150, base_lr=args.learning_rate,
+        min_lr=1e-5
+    )
+    if os.path.exists('./models/optimizer_step'):
+        state_dict = torch.load('./models/optimizer_step')
+        optimizer.load_state_dict(state_dict)
+    
+    if os.path.exists('./models/scheduler_step'):
+        state_dict = torch.load('./models/scheduler_step')
+        scheduler.load_state_dict(state_dict)
+    if world_size > 1:
+        processes = []
+        mp.set_start_method('spawn', force=True)
+        for rank in world_size:    
+            p = mp.Process(train_multi_gpu, 
+                args=(rank, world_size, model, optimizer, scheduler, tokenizer, mem_optimized_training, args),
+                nprocs=world_size,
+                join=True
             )
-        else:
-            optimizer = torch.optim.Adam(
-                model.parameters(), lr=args.learning_rate
-            )
-    train(model, device, optimizer, tokenizer, mem_optimized_training, args)
+            p.start()
+            processes.append(p)
 
-# sample run: python ./training/training.py --config-json=./training/sample.json --attention-type=gpa --tokenizer-type=cl100k_base --optimizer-type=AdamW8bit_opt --learning-rate=1e-7 --epochs=1
+        for p in processes:
+            p.join()
+    else:
+        train(model, device, optimizer, scheduler, tokenizer, mem_optimized_training, args)
+
+# sample run: python ./training/training.py --config-json=./training/sample.json --tokenizer-type=cl100k_base --optimizer-type=AdamW8bit_opt --mem-opt=false --learning-rate=2e-5 --epochs=1
 # Note: run from root Celiumnet folder.
 if __name__=='__main__':
     parser = argparse.ArgumentParser()

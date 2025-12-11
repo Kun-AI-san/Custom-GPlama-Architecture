@@ -1,6 +1,22 @@
 import torch.nn as nn
 import torch
 
+def precompute_freqs(theta=10000, end=2048, emb_dim=896):
+    freqs = 1/(theta ** (torch.arange(0, emb_dim, 2, requires_grad=False, device='cuda')/emb_dim))
+    t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    cs = torch.outer(t, freqs)
+    pre_freqs = torch.polar(torch.ones_like(cs), cs)
+    return pre_freqs
+
+def apply_rotatory_emb(q, k, pre_freqs, d_in):
+    pre_freqs = pre_freqs.unsqueeze(0).unsqueeze(0)
+    q_ = torch.view_as_complex(q.view(*q.shape[:-1], -1, 2))
+    k_ = torch.view_as_complex(k.view(*k.shape[:-1], -1, 2))
+    q_out = torch.view_as_real(q_ * pre_freqs).flatten(3)
+    k_out = torch.view_as_real(k_ * pre_freqs).flatten(3)
+    return q_out.type_as(q), k_out.type_as(k)
+
+
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, n_kv_heads, head_dim = x.shape
@@ -41,6 +57,11 @@ class Multihead_Attention(nn.Module):
         keys = keys.view(b, num_tokens, self.num_heads, self.head_dim)
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
         vals = vals.view(b, num_tokens, self.num_heads, self.head_dim)
+
+        pre_freqs = precompute_freqs(end=num_tokens)
+        queries, keys = apply_rotatory_emb(queries.view(b, num_tokens, d_in), keys.view(b, num_tokens, d_in), pre_freqs, d_in)
+
+        queries, keys = queries.view(b, num_tokens, self.num_heads, self.head_dim), keys.view(b, num_tokens, self.num_heads, self.head_dim)
 
         keys = keys.transpose(1, 2)
         queries = queries.transpose(1, 2)
@@ -97,6 +118,11 @@ class Grouped_Query_Attention(nn.Module):
         
         keys = repeat_kv(keys, n_rep=(self.num_heads//self.n_groups))
         vals = repeat_kv(vals, n_rep=(self.num_heads//self.n_groups))
+
+        pre_freqs = precompute_freqs(end=num_tokens)
+        queries, keys = apply_rotatory_emb(queries.view(b, num_tokens, d_in), keys.view(b, num_tokens, d_in), pre_freqs)
+
+        queries, keys = queries.view(b, num_tokens, self.num_heads, self.head_dim), keys.view(b, num_tokens, self.num_heads, self.head_dim)
         
         keys = keys.transpose(1, 2)
         queries = queries.transpose(1, 2)
